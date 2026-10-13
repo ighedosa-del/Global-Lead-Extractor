@@ -1,1 +1,1 @@
-{"name":"lzn-ai-global-lead-extractor","version":"1.0.0","private":true,"type":"module","scripts":{"start":"node server.js"},"engines":{"node":">=20"},"dependencies":{"express":"^4.21.2"}}
+{"name":"lzn-global-lead-extractor","version":"4.0.0","type":"module","scripts":{"start":"node server.js","check":"node --check server.js && node --check public/app.js"},"dependencies":{"express":"^4.21.2","csv-parse":"^5.6.0","pg":"^8.13.1"}}

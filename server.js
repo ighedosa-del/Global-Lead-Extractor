@@ -1,110 +1,66 @@
 
 import express from 'express';
-import dns from 'node:dns/promises';
 import path from 'node:path';
+import fs from 'node:fs';
 import {fileURLToPath} from 'node:url';
-const app=express(), root=path.dirname(fileURLToPath(import.meta.url));
-app.disable('x-powered-by');app.use(express.json({limit:'20kb'}));app.use(express.static(path.join(root,'public')));
+import {parse} from 'csv-parse/sync';
+import pg from 'pg';
+const root=path.dirname(fileURLToPath(import.meta.url)), app=express();
 const countries={CA:'Canada',US:'United States',NG:'Nigeria',GB:'United Kingdom',IN:'India',DE:'Germany',FR:'France',ZA:'South Africa',GH:'Ghana',KE:'Kenya',AE:'United Arab Emirates',AU:'Australia',BR:'Brazil',JP:'Japan',SG:'Singapore'};
-const industries=['manufacturing','agriculture','technology','retail','hospitality','healthcare','construction','logistics','finance'];
-// Small metro bounding boxes (south,west,north,east), not whole-country queries.
-const metros={
- NG:[['Lagos',[6.44,3.32,6.60,3.52]],['Abuja',[9.00,7.39,9.12,7.56]]],
- CA:[['Toronto',[43.62,-79.46,43.73,-79.32]],['Montreal',[45.47,-73.65,45.56,-73.53]]],
- US:[['New York',[40.70,-74.02,40.80,-73.91]],['Los Angeles',[34.00,-118.31,34.10,-118.20]]],
- GB:[['London',[51.47,-0.17,51.55,-0.06]],['Manchester',[53.44,-2.29,53.51,-2.19]]],
- IN:[['Mumbai',[18.94,72.79,19.06,72.91]],['Delhi',[28.59,77.16,28.70,77.28]]],
- DE:[['Berlin',[52.47,13.35,52.56,13.48]]],FR:[['Paris',[48.82,2.29,48.89,2.39]]],
- ZA:[['Johannesburg',[-26.24,28.00,-26.15,28.10]]],GH:[['Accra',[5.54,-0.24,5.63,-0.13]]],
- KE:[['Nairobi',[-1.33,36.78,-1.24,36.89]]],AE:[['Dubai',[25.17,55.23,25.28,55.36]]],
- AU:[['Sydney',[-33.91,151.16,-33.82,151.26]]],BR:[['Sao Paulo',[-23.61,-46.70,-23.52,-46.60]]],
- JP:[['Tokyo',[35.64,139.68,35.73,139.81]]],SG:[['Singapore',[1.27,103.79,1.36,103.90]]]
-};
-const tags={
- manufacturing:['["industrial"="factory"]','["craft"]'],agriculture:['["shop"="agrarian"]','["landuse"="farmyard"]'],
- technology:['["office"="it"]','["shop"="computer"]'],retail:['["shop"]'],hospitality:['["tourism"="hotel"]','["amenity"="restaurant"]'],
- healthcare:['["amenity"="clinic"]','["amenity"="pharmacy"]'],construction:['["office"="construction_company"]','["craft"="builder"]'],
- logistics:['["office"="logistics"]','["amenity"="post_office"]'],finance:['["amenity"="bank"]','["office"="financial"]']
-};
-const endpoints=['https://overpass.kumi.systems/api/interpreter','https://overpass.private.coffee/api/interpreter','https://overpass.nchc.org.tw/api/interpreter'];
-const cache=new Map();let nextAllowed=0;
-const clean=v=>typeof v==='string'?v.trim().slice(0,300):'';
-const emailOf=t=>clean(t['contact:email']||t.email||'').split(/[;,\s]/)[0].toLowerCase();
-function osmLead(x,industry,country,city){
- const t=x.tags||{},email=emailOf(t),name=clean(t.name||t.brand||t.operator);
- if(!name)return null;
- return {id:`osm:${x.type}:${x.id}`,company:name,industry,country,city,address:clean([t['addr:housenumber'],t['addr:street'],t['addr:city']||city].filter(Boolean).join(' ')),email,phone:clean(t['contact:phone']||t.phone),website:clean(t['contact:website']||t.website),role:'Not provided',emailStatus:email?'Published; mailbox unverified':'Not listed',source:`https://www.openstreetmap.org/${x.type}/${x.id}`,provider:'OpenStreetMap'};
+const industries=['manufacturing','agriculture','technology','retail','hospitality','healthcare','construction','logistics','finance','other'];
+const pool=process.env.DATABASE_URL?new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.PGSSL==='true'?{rejectUnauthorized:false}:undefined}):null;
+const store=path.join(root,'data','leads.jsonl');fs.mkdirSync(path.dirname(store),{recursive:true});
+let memory=new Map(), ready=false;
+const trim=(x,n=500)=>String(x??'').trim().slice(0,n);
+const field=(obj,keys)=>{for(const k of keys){const key=Object.keys(obj).find(x=>x.toLowerCase().replace(/[^a-z0-9]/g,'')===k.toLowerCase().replace(/[^a-z0-9]/g,''));if(key&&obj[key]!==undefined&&obj[key]!==null&&String(obj[key]).trim())return obj[key]}return ''};
+function normalize(obj,defaults){
+ const company=trim(field(obj,['company','company_name','business','business_name','name','names.primary','displayName']),200);
+ const country=trim(field(obj,['country','country_code','countrycode','iso_country'])||defaults.country,2).toUpperCase();
+ if(!company||!countries[country])return null;
+ const industry=trim(field(obj,['industry','sector','category','taxonomy.primary'])||defaults.industry||'other',80).toLowerCase();
+ const email=trim(field(obj,['email','contact:email','contact_email']),200);
+ const website=trim(field(obj,['website','url','contact:website']),300);
+ const phone=trim(field(obj,['phone','telephone','contact:phone']),100);
+ const source=trim(field(obj,['source','source_url','reference_url'])||defaults.source,500);
+ const id=trim(field(obj,['id','gers_id','osm_id'])||`${country}|${company.toLowerCase()}|${website.toLowerCase()}`,350);
+ return {id,company,country,industry,address:trim(field(obj,['address','formatted_address','location']),400),email,phone,website,source,provider:defaults.provider||'Imported licensed dataset',emailStatus:email?'Published/imported — mailbox not verified':'Not provided'};
 }
-async function requestJson(url,options={},timeout=12000){
- const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);
- try {const r=await fetch(url,{...options,signal:controller.signal});if(!r.ok)throw Error(`HTTP ${r.status}`);return await r.json();}
- finally{clearTimeout(timer);}
+async function initialize(){
+ if(pool){await pool.query(`CREATE TABLE IF NOT EXISTS lzn_leads (id TEXT PRIMARY KEY, country TEXT NOT NULL, industry TEXT NOT NULL, company TEXT NOT NULL, data JSONB NOT NULL)`)}
+ else if(fs.existsSync(store)){for(const line of fs.readFileSync(store,'utf8').split('\n')){if(!line.trim())continue;try{const x=JSON.parse(line);memory.set(x.id,x)}catch{}}}
+ ready=true;
 }
-async function osmSearch(country,industry,metro,limit,diagnostics){
- const [city,bbox]=metro;const bounds=bbox.join(',');
- const selectors=tags[industry].map(t=>`nwr${t}(${bounds})["name"];`).join('');
- const query=`[out:json][timeout:20];(${selectors});out center ${Math.min(limit,250)};`;
- for(const endpoint of endpoints){
-  try{
-   const data=await requestJson(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({data:query})},11000);
-   if(!Array.isArray(data.elements))throw Error('Missing elements');
-   diagnostics.push(`${new URL(endpoint).hostname}: ${data.elements.length} map records (${city})`);
-   return data.elements.map(x=>osmLead(x,industry,country,city)).filter(Boolean);
-  }catch(e){diagnostics.push(`${new URL(endpoint).hostname}: ${e.name==='AbortError'?'timeout':e.message} (${city})`);}
- }
- return [];
+async function putMany(rows){
+ if(pool){const client=await pool.connect();try{await client.query('BEGIN');for(const x of rows)await client.query('INSERT INTO lzn_leads(id,country,industry,company,data) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data,country=EXCLUDED.country,industry=EXCLUDED.industry,company=EXCLUDED.company',[x.id,x.country,x.industry,x.company,x]);await client.query('COMMIT')}catch(e){await client.query('ROLLBACK');throw e}finally{client.release()}}
+ else {for(const x of rows)memory.set(x.id,x);fs.writeFileSync(store,[...memory.values()].map(x=>JSON.stringify(x)).join('\n')+'\n')}
 }
-async function googleSearch(country,industry,city,limit,diagnostics){
- const key=process.env.GOOGLE_PLACES_API_KEY;
- if(!key)return [];
- const found=[];let token;
- for(let page=0;page<Math.min(3,Math.ceil(limit/20));page++){
-  const body={textQuery:`${industry} businesses in ${city}, ${countries[country]}`,pageSize:Math.min(20,limit-found.length)};
-  if(token)body.pageToken=token;
-  try{
-   const data=await requestJson('https://places.googleapis.com/v1/places:searchText',{method:'POST',headers:{'Content-Type':'application/json','X-Goog-Api-Key':key,'X-Goog-FieldMask':'places.id,places.displayName,places.formattedAddress,places.websiteUri,places.nationalPhoneNumber,nextPageToken'},body:JSON.stringify(body)},15000);
-   for(const p of data.places||[])found.push({id:`google:${p.id}`,company:clean(p.displayName?.text),industry,country,city,address:clean(p.formattedAddress),email:'',phone:clean(p.nationalPhoneNumber),website:clean(p.websiteUri),role:'Not provided',emailStatus:'Not listed',source:`https://www.google.com/maps/place/?q=place_id:${encodeURIComponent(p.id)}`,provider:'Google Places'});
-   token=data.nextPageToken;if(!token)break;
-  }catch(e){diagnostics.push(`Google Places: ${e.message}`);break;}
- }
- diagnostics.push(`Google Places: ${found.length} records (${city})`);return found;
+async function getRows(country,industry,limit,offset){
+ if(pool){const r=await pool.query(`SELECT data FROM lzn_leads WHERE country=$1 AND ($2='all' OR industry=$2) ORDER BY company LIMIT $3 OFFSET $4`,[country,industry,limit,offset]);const count=await pool.query(`SELECT COUNT(*)::int AS n FROM lzn_leads WHERE country=$1 AND ($2='all' OR industry=$2)`,[country,industry]);return {leads:r.rows.map(x=>x.data),total:count.rows[0].n}}
+ const matches=[...memory.values()].filter(x=>x.country===country&&(industry==='all'||x.industry===industry)).sort((a,b)=>a.company.localeCompare(b.company));
+ return {leads:matches.slice(offset,offset+limit),total:matches.length};
 }
-app.get('/api/options',(_,res)=>res.json({countries,industries,metros:Object.fromEntries(Object.entries(metros).map(([c,m])=>[c,m.map(x=>x[0])]))}));
-app.get('/api/health',(_,res)=>res.json({ok:true,version:3,googlePlacesConfigured:Boolean(process.env.GOOGLE_PLACES_API_KEY)}));
-app.get('/api/search',async(req,res)=>{
- const country=clean(req.query.country).toUpperCase(),industry=clean(req.query.industry).toLowerCase(),city=clean(req.query.city);
- const limit=Math.min(500,Math.max(1,parseInt(req.query.limit,10)||100));
- if(!countries[country]||!industries.includes(industry))return res.status(400).json({error:'Unsupported country or industry.'});
- const available=metros[country];
- const key=[country,industry,limit,Boolean(process.env.GOOGLE_PLACES_API_KEY)].join(':');
- const hit=cache.get(key);if(hit&&Date.now()-hit.time<600000)return res.json({...hit.value,cached:true});
- if(Date.now()<nextAllowed)return res.status(429).json({error:'Please wait 5 seconds between searches.'});
- nextAllowed=Date.now()+5000;
- const diagnostics=[];console.log('SEARCH',country,industry,'country-mode',limit);
+app.disable('x-powered-by');app.use(express.static(path.join(root,'public')));
+app.get('/api/options',(_,res)=>res.json({countries,industries:['all',...industries]}));
+app.get('/api/health',(_,res)=>res.json({ok:ready,version:4,storage:pool?'PostgreSQL':'local JSONL (ephemeral on Render)',provider:'imported datasets; no live scraping'}));
+app.get('/api/search',async(req,res)=>{try{
+ const country=trim(req.query.country,2).toUpperCase(),industry=trim(req.query.industry||'all',80).toLowerCase(),limit=Math.max(1,Math.min(500,Number(req.query.limit)||100)),offset=Math.max(0,Math.min(100000000,Number(req.query.offset)||0));
+ if(!countries[country])return res.status(400).json({error:'Invalid country'});
+ const data=await getRows(country,industry,limit,offset);
+ res.json({...data,notice:data.total?'Records from imported datasets. Contact details are not independently verified.':'No data imported for this selection. Import a licensed country dataset first.',storage:pool?'PostgreSQL':'local JSONL'});
+ }catch(e){console.error(e);res.status(500).json({error:'Search failed; check server logs'})}});
+const uploadAuth=(req,res,next)=>{const key=process.env.ADMIN_IMPORT_KEY;if(!key)return res.status(503).json({error:'Set ADMIN_IMPORT_KEY in Render environment before importing'});if(req.headers['x-admin-key']!==key)return res.status(401).json({error:'Invalid import key'});next()};
+app.post('/api/import',uploadAuth,express.raw({type:['text/csv','application/json','application/geo+json'],limit:'12mb'}),async(req,res)=>{
  try{
-  const leads=[];const seen=new Set();
-  // Search all configured regions automatically. Expand the region catalog or add a
-  // licensed nationwide provider for broader coverage; do not claim completeness.
-  for(const metro of available){
-   if(leads.length>=limit)break;
-   const remaining=limit-leads.length;
-   const google=await googleSearch(country,industry,metro[0],remaining,diagnostics);
-   const osm=google.length>=remaining?[]:await osmSearch(country,industry,metro,remaining-google.length,diagnostics);
-   for(const lead of [...google,...osm]){
-    const dedupe=(lead.website||lead.company+'|'+lead.city).toLowerCase();
-    if(!seen.has(dedupe)){seen.add(dedupe);leads.push(lead);}
-    if(leads.length>=limit)break;
-   }
-  }
-  const value={leads,count:leads.length,diagnostics,notice:leads.length?'Country mode searches all currently configured regions, not every city. These are published business listings, not verified email recipients.':'No records returned from configured regions. Try another industry or configure GOOGLE_PLACES_API_KEY.',attribution:'© OpenStreetMap contributors (ODbL); Google Places data subject to Google Maps Platform terms'};
-  console.log('RESULT',leads.length,diagnostics.join(' | '));cache.set(key,{time:Date.now(),value});
-  return res.json(value);
- }catch(e){console.error('SEARCH ERROR',e);return res.status(502).json({error:'Provider search failed',diagnostics:[...diagnostics,e.message]});}
+  const country=trim(req.query.country,2).toUpperCase(),industry=trim(req.query.industry||'other',80).toLowerCase(),source=trim(req.query.source,500);
+  if(!countries[country]||!source||!/^https?:\/\//.test(source))return res.status(400).json({error:'Country and original source URL required'});
+  const body=req.body?.toString('utf8')||'';let objects=[];
+  if(req.is('text/csv'))objects=parse(body,{columns:true,skip_empty_lines:true,bom:true,relax_column_count:true});
+  else {const doc=JSON.parse(body);objects=Array.isArray(doc)?doc:doc.type==='FeatureCollection'?doc.features.map(f=>({...f.properties,...f.properties?.names, name:f.properties?.names?.primary||f.properties?.name})):[];}
+  if(objects.length>25000)return res.status(413).json({error:'Maximum 25,000 records per import; split larger files'});
+  const valid=objects.map(o=>normalize(o,{country,industry,source,provider:'Imported licensed dataset'})).filter(Boolean);
+  await putMany(valid);console.log('IMPORT',country,objects.length,valid.length);
+  res.json({received:objects.length,imported:valid.length,skipped:objects.length-valid.length,notice:'Source records imported. Emails and phones are NOT verified.'});
+ }catch(e){console.error('IMPORT ERROR',e);res.status(400).json({error:e.message})}
 });
-app.post('/api/check-email',async(req,res)=>{
- const email=clean(req.body?.email).toLowerCase();
- if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))return res.json({status:'Invalid format'});
- try{const mx=await dns.resolveMx(email.split('@')[1]);return res.json({status:mx.length?'Domain has MX records; mailbox NOT verified':'No MX records'});}
- catch{return res.json({status:'MX lookup unavailable; mailbox NOT verified'});}
-});
-app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('LZ-N V3 Lead Extractor listening'));
+app.use((err,req,res,next)=>res.status(err.status||500).json({error:err.type==='entity.too.large'?'File too large': 'Invalid request'}));
+initialize().then(()=>app.listen(process.env.PORT||10000,'0.0.0.0',()=>console.log('LZ-N V4 free dataset engine listening'))).catch(e=>{console.error('DATABASE STARTUP ERROR',e);process.exit(1)});
