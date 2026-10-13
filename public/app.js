@@ -12,3 +12,21 @@ $('importForm').addEventListener('submit',async e=>{
  $('importMessage').textContent=`Imported ${d.imported} records; skipped ${d.skipped}. Click Find Businesses to view. Contact information is unverified.`;
  }catch(err){$('importMessage').textContent=err.message}finally{btn.disabled=false}
 });
+
+let lastJob={};
+async function refreshJob(){
+ try{const r=await fetch('/api/job');lastJob=await r.json();$('jobStatus').textContent=`${lastJob.status} — Country: ${lastJob.country||'none'} · Tiles ${lastJob.completed||0}/${lastJob.total||0} · Imported this run: ${lastJob.imported||0}${lastJob.error?' · Last error: '+lastJob.error:''}`;}
+ catch(e){$('jobStatus').textContent='Collector status unavailable: '+e.message}
+}
+async function controlJob(action,resume=false){
+ const key=$('adminKey').value;if(!key){$('jobStatus').textContent='Enter your ADMIN_IMPORT_KEY in the Admin import key field below.';return}
+ try{
+ const body=action==='start'?JSON.stringify({country:$('country').value,startIndex:resume&&lastJob.country===$('country').value?lastJob.completed:0}):undefined;
+ const r=await fetch('/api/job/'+action,{method:'POST',headers:{'x-admin-key':key,...(body?{'Content-Type':'application/json'}:{})},body});
+ const data=await r.json();if(!r.ok)throw Error(data.error||'Action failed');await refreshJob();
+ }catch(e){$('jobStatus').textContent=e.message}
+}
+$('startJob').addEventListener('click',()=>controlJob('start'));
+$('stopJob').addEventListener('click',()=>controlJob('stop'));
+$('resumeJob').addEventListener('click',()=>controlJob('start',true));
+refreshJob();setInterval(refreshJob,10000);

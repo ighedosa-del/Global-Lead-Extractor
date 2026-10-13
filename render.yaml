@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: global-lead-extractor-v5
+    runtime: docker
+    envVars:
+      - key: ADMIN_IMPORT_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        sync: false
