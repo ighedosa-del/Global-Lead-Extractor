@@ -75,17 +75,28 @@ app.get('/api/search',async(req,res)=>{
  const country=clean(req.query.country).toUpperCase(),industry=clean(req.query.industry).toLowerCase(),city=clean(req.query.city);
  const limit=Math.min(500,Math.max(1,parseInt(req.query.limit,10)||100));
  if(!countries[country]||!industries.includes(industry))return res.status(400).json({error:'Unsupported country or industry.'});
- const available=metros[country],metro=available.find(m=>m[0]===city)||available[0];
- const key=[country,industry,metro[0],limit,Boolean(process.env.GOOGLE_PLACES_API_KEY)].join(':');
+ const available=metros[country];
+ const key=[country,industry,limit,Boolean(process.env.GOOGLE_PLACES_API_KEY)].join(':');
  const hit=cache.get(key);if(hit&&Date.now()-hit.time<600000)return res.json({...hit.value,cached:true});
  if(Date.now()<nextAllowed)return res.status(429).json({error:'Please wait 5 seconds between searches.'});
  nextAllowed=Date.now()+5000;
- const diagnostics=[];console.log('SEARCH',country,industry,metro[0],limit);
+ const diagnostics=[];console.log('SEARCH',country,industry,'country-mode',limit);
  try{
-  const google=await googleSearch(country,industry,metro[0],limit,diagnostics);
-  const osm=google.length>=limit?[]:await osmSearch(country,industry,metro,limit-google.length,diagnostics);
-  const leads=[...new Map([...google,...osm].map(x=>[x.id,x])).values()].slice(0,limit);
-  const value={leads,count:leads.length,diagnostics,notice:leads.length?'These are published business listings, not verified email recipients.':'No records returned. Try a different city/industry or configure GOOGLE_PLACES_API_KEY for an additional provider.',attribution:'© OpenStreetMap contributors (ODbL); Google Places data subject to Google Maps Platform terms'};
+  const leads=[];const seen=new Set();
+  // Search all configured regions automatically. Expand the region catalog or add a
+  // licensed nationwide provider for broader coverage; do not claim completeness.
+  for(const metro of available){
+   if(leads.length>=limit)break;
+   const remaining=limit-leads.length;
+   const google=await googleSearch(country,industry,metro[0],remaining,diagnostics);
+   const osm=google.length>=remaining?[]:await osmSearch(country,industry,metro,remaining-google.length,diagnostics);
+   for(const lead of [...google,...osm]){
+    const dedupe=(lead.website||lead.company+'|'+lead.city).toLowerCase();
+    if(!seen.has(dedupe)){seen.add(dedupe);leads.push(lead);}
+    if(leads.length>=limit)break;
+   }
+  }
+  const value={leads,count:leads.length,diagnostics,notice:leads.length?'Country mode searches all currently configured regions, not every city. These are published business listings, not verified email recipients.':'No records returned from configured regions. Try another industry or configure GOOGLE_PLACES_API_KEY.',attribution:'© OpenStreetMap contributors (ODbL); Google Places data subject to Google Maps Platform terms'};
   console.log('RESULT',leads.length,diagnostics.join(' | '));cache.set(key,{time:Date.now(),value});
   return res.json(value);
  }catch(e){console.error('SEARCH ERROR',e);return res.status(502).json({error:'Provider search failed',diagnostics:[...diagnostics,e.message]});}
