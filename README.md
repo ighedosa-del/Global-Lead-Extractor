@@ -1,17 +1,22 @@
-# LZ-N Global Lead Extractor — V2 diagnostic build
+# LZ-N Global Lead Extractor V3
 
-## Deploy
-Upload the **contents** of this project directory to the root of your existing GitHub repository. Render: Node, build `npm install`, start `npm start`. No new service required.
+Node 20+, Express. Preserve existing blue/white dashboard.
 
-## Improvements
-- Fixed front-end selection initialization (carried forward).
-- Multi-endpoint Overpass fallback with meaningful diagnostics when providers fail.
-- Named-business filtering and up to 500 results **per query**.
-- 1,000,000 leads is an aspirational cumulative target, **not** a per-request minimum or a guarantee.
-- Contacts are only those publicly listed on OSM; no fabricated data or misleading verified status.
+## Deploy on Render
+1. Upload extracted project contents (including `package.json`) to your existing GitHub repository root.
+2. Render: build `npm install`, start `npm start`.
+3. No key required for OpenStreetMap-based city searches. Optional environment variable `GOOGLE_PLACES_API_KEY` enables Google Places Text Search. This provider requires a Google Cloud project, enabled Places API (New), billing, and appropriate terms-of-service compliance.
+4. Visit `/api/health` to confirm V3. Use the City selector and search. Check Render logs for `SEARCH` and `RESULT` diagnostics.
 
-## Limitations
-This is a diagnostic/starter build, not a verified million-contact database. Public Overpass servers may time out, rate-limit, or return zero matching records. Public OSM coverage is sparse for some industries and regions. Bulk extraction needs an appropriately licensed provider or hosted OSM dataset, a persistent database, deduplication, quotas, opt-out handling, and permission-aware outreach. MX checks cannot verify a mailbox exists.
+## What changed
+- Replaced huge country-wide Overpass queries with small metro bounding-box searches.
+- Added a City selector, public-provider fallback, detailed diagnostics, and an optional Google Places source.
+- Returned source links and real published contact fields only; no invented emails.
+- Results are up to 500 per request; NOT a million-lead crawler. There is no persistent database or background extraction yet.
+- Public Overpass endpoints may still timeout or rate-limit; optional Google Places requires API credentials and usage charges.
+- Email syntax and MX records do not establish mailbox ownership or deliverability.
+- Follow applicable privacy, anti-spam and data-provider terms. Google Places storage/reuse restrictions may apply.
 
-## Test
-Open `/api/health` for service status; `/api/options` for dropdown values. Try a high-coverage country and Retail or Hospitality. If the result is zero, check the browser message and Render logs.
+## Local run
+`npm install && npm start`
+Then visit http://localhost:10000
